@@ -20,7 +20,7 @@ class OrderController extends Controller
             'currency' => ['sometimes', 'string', 'size:3'],
         ]);
 
-        $order = Order::create($data + ['reference' => 'ORD-'.strtoupper(Str::random(10))]);
+        $order = Order::create($data + ['reference' => 'ORD-'.strtoupper(Str::random(10)), 'status' => Order::PENDING]);
 
         try {
             $order->update(['payment_id' => $gateway->createPayment($order)]);
