@@ -1,59 +1,67 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# paywebhook
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+A small Laravel 12 app that shows how to connect to a payment provider properly: create payments with an idempotency key, retry temporary failures, and receive the provider's webhooks safely. It is a portfolio project. There is no real payment provider in it: a tiny built-in simulator plays that role, and the signature format is modelled on what Stripe-style providers do.
 
-## About Laravel
+## What it handles
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+| Problem | What the code does |
+|---|---|
+| Someone posts fake events to the webhook URL | Every request must carry `Gateway-Signature: t=<time>,v1=<hmac>`. The HMAC-SHA256 is checked on the raw body with `hash_equals`. |
+| An old, valid request is sent again later (replay) | The signed timestamp must be within 5 minutes. |
+| The provider delivers the same event twice | The event id is stored with a unique index. The second delivery answers `duplicate` and nothing runs twice. |
+| Processing is slow or fails | The endpoint only stores the event and queues a job, then answers at once. The job retries with growing delays (5s, 20s, 60s, 180s). |
+| Events arrive in the wrong order (refund before payment) | A refund for an order that is still `pending` is put back on the queue until the payment event has been applied. |
+| A late event must not undo a newer state | State changes are checked: a failed event can't touch a paid order, a late success can't undo a refund. |
+| Our call to the provider times out and we send it again | Every attempt carries the same `Idempotency-Key` (the order reference), so the provider creates one payment only. 5xx errors and connection errors are retried, 4xx errors are not. |
+| An event fails for good | It is marked `failed` with the error, and `php artisan webhooks:replay` queues it again. |
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+## Endpoints
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+| Method | Path | |
+|---|---|---|
+| POST | `/api/orders` | Create an order and a payment at the provider. Body: `customer_email`, `amount` (minor units), optional `currency`. |
+| GET | `/api/orders/{reference}` | Order status: `pending`, `paid`, `failed`, `refunded`. |
+| POST | `/api/webhooks/payments` | Called by the provider. Events: `payment.succeeded`, `payment.failed`, `refund.completed`. |
 
-## Learning Laravel
+The API has no login on purpose, to keep the focus on the integration.
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework. You can also check out [Laravel Learn](https://laravel.com/learn), where you will be guided through building a modern Laravel application.
+## Running it
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+```bash
+composer install
+cp .env.example .env && php artisan key:generate
+touch database/database.sqlite
+php artisan migrate
+php artisan serve --port=8093      # the app
+php artisan serve --port=8094      # the simulated provider (same code, second process)
+php artisan queue:work             # processes webhook events
+```
 
-## Laravel Sponsors
+The PHP dev server handles one request at a time, which is why the simulator needs its own process.
 
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the [Laravel Partners program](https://partners.laravel.com).
+Try it:
 
-### Premium Partners
+```bash
+curl -s -X POST localhost:8093/api/orders -H 'Accept: application/json' -H 'Content-Type: application/json' \
+  -d '{"customer_email":"a@b.com","amount":49900}'
+# note the "reference" in the answer
 
-- **[Vehikl](https://vehikl.com)**
-- **[Tighten Co.](https://tighten.co)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel)**
-- **[DevSquad](https://devsquad.com/hire-laravel-developers)**
-- **[Redberry](https://redberry.international/laravel-development)**
-- **[Active Logic](https://activelogic.com)**
+php artisan gateway:send ORD-XXXX payment.succeeded --id=evt_1   # received
+php artisan gateway:send ORD-XXXX payment.succeeded --id=evt_1   # duplicate
+php artisan gateway:send ORD-XXXX payment.succeeded --bad-signature   # 400 Invalid signature
+php artisan gateway:send ORD-XXXX payment.succeeded --age=900         # 400 too old
+php artisan gateway:send ORD-XXXX refund.completed
+curl -s localhost:8093/api/orders/ORD-XXXX -H 'Accept: application/json'   # refunded
+```
 
-## Contributing
+`gateway:send` builds a signed request exactly like a provider would.
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+## Tests
 
-## Code of Conduct
+```bash
+php artisan test
+```
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+23 tests cover the signature checks (missing, malformed, wrong secret, tampered body, too old), duplicates, every state change, out-of-order events, failed events and replay, plus the outgoing call (idempotency key, retries, giving up, no retry on 4xx). CI runs Pint and the tests on PHP 8.2 and 8.3.
 
-## Security Vulnerabilities
-
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
-
-## License
-
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+For how it all fits together, read [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
